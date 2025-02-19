@@ -13,6 +13,7 @@ from datetime import timedelta
 from google.cloud import storage
 from kokoro import KModel, KPipeline
 import runpod
+from pydub import AudioSegment
 
 # Initialize CUDA and Kokoro model/pipelines
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -47,7 +48,6 @@ def synthesize_text_to_wav(text, voice, speed, wav_filename):
         raise Exception("No audio generated.")
     
     combined_audio = np.concatenate(audio_parts)
-    # Convert float32 [-1, 1] to 16-bit PCM
     int_audio = (combined_audio * 32767).clip(-32768, 32767).astype(np.int16)
     
     with wave.open(wav_filename, 'wb') as wav_file:
@@ -87,39 +87,103 @@ def generate_signed_url(blob, expiration_minutes=15):
 
 def handler(job):
     job_input = job.get('input', {})
-    text = job_input.get('text', '')
-    voice = job_input.get('voice', 'af_heart')
+    mode = job_input.get('mode', 'single')  # 'single' or 'podcast'
     try:
         speed = float(job_input.get('speed', 1.0))
     except Exception:
         speed = 1.0
 
-    if not text:
-        return {"error": "No text provided.", "success": False}
-
-    try:
-        # Generate temporary file paths
-        temp_wav = f"/tmp/tts_temp_{int(time.time())}.wav"
-        temp_mp3 = f"/tmp/tts_temp_{int(time.time())}.mp3"
-        output_filename = generate_unique_filename(voice)
+    bucket_name = "research-digest-tts-out"
+    
+    if mode == 'podcast':
+        segments = job_input.get('segments', [])
+        if not segments:
+            return {"error": "No segments provided for podcast mode.", "success": False}
+        # Voice options can be overridden via API
+        host_voice = job_input.get('host_voice', 'am_michael')
+        expert_voice = job_input.get('expert_voice', 'af_bella')
+        default_voice = job_input.get('default_voice', 'af_heart')
+        silence_duration_ms = int(job_input.get('silence_duration_ms', 300))
         
-        # Synthesize audio and write to WAV
-        synthesize_text_to_wav(text, voice, speed, temp_wav)
-        # Convert WAV to MP3
-        convert_wav_to_mp3(temp_wav, temp_mp3)
-        
-        # Upload MP3 to Google Cloud Storage
-        bucket_name = "research-digest-tts-out"
-        blob = upload_blob(bucket_name, temp_mp3, output_filename)
-        download_url = generate_signed_url(blob)
-        
-        return {
-            "download_url": download_url,
-            "filename": output_filename,
-            "success": True
-        }
-        
-    except Exception as e:
-        return {"error": f"TTS processing failed: {str(e)}", "success": False}
+        segment_wav_files = []
+        try:
+            for idx, seg in enumerate(segments):
+                text = seg.get('text', '')
+                if not text:
+                    continue
+                speaker = seg.get('speaker', 'host').lower()
+                if speaker == 'host':
+                    voice = host_voice
+                elif speaker == 'expert':
+                    voice = expert_voice
+                else:
+                    voice = seg.get('voice', default_voice)
+                temp_wav = f"/tmp/tts_segment_{idx}_{int(time.time())}.wav"
+                synthesize_text_to_wav(text, voice, speed, temp_wav)
+                segment_wav_files.append(temp_wav)
+            
+            if not segment_wav_files:
+                raise Exception("No valid segments synthesized.")
+            
+            combined_audio = None
+            silence = AudioSegment.silent(duration=silence_duration_ms)
+            for wav_file in segment_wav_files:
+                segment_audio = AudioSegment.from_wav(wav_file)
+                if combined_audio is None:
+                    combined_audio = segment_audio
+                else:
+                    combined_audio += silence + segment_audio
+            
+            combined_wav = f"/tmp/tts_combined_{int(time.time())}.wav"
+            combined_audio.export(combined_wav, format="wav")
+            output_filename = generate_unique_filename("podcast")
+            combined_mp3 = f"/tmp/tts_combined_{int(time.time())}.mp3"
+            convert_wav_to_mp3(combined_wav, combined_mp3)
+            blob = upload_blob(bucket_name, combined_mp3, output_filename)
+            download_url = generate_signed_url(blob)
+            
+            for f in segment_wav_files:
+                if os.path.exists(f):
+                    os.remove(f)
+            if os.path.exists(combined_wav):
+                os.remove(combined_wav)
+            if os.path.exists(combined_mp3):
+                os.remove(combined_mp3)
+            
+            return {
+                "download_url": download_url,
+                "filename": output_filename,
+                "success": True
+            }
+        except Exception as e:
+            return {"error": f"Podcast TTS processing failed: {str(e)}", "success": False}
+    
+    else:
+        text = job_input.get('text', '')
+        if not text:
+            return {"error": "No text provided.", "success": False}
+        voice = job_input.get('voice', 'af_heart')
+        try:
+            temp_wav = f"/tmp/tts_temp_{int(time.time())}.wav"
+            temp_mp3 = f"/tmp/tts_temp_{int(time.time())}.mp3"
+            output_filename = generate_unique_filename(voice)
+            
+            synthesize_text_to_wav(text, voice, speed, temp_wav)
+            convert_wav_to_mp3(temp_wav, temp_mp3)
+            blob = upload_blob(bucket_name, temp_mp3, output_filename)
+            download_url = generate_signed_url(blob)
+            
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
+            if os.path.exists(temp_mp3):
+                os.remove(temp_mp3)
+            
+            return {
+                "download_url": download_url,
+                "filename": output_filename,
+                "success": True
+            }
+        except Exception as e:
+            return {"error": f"TTS processing failed: {str(e)}", "success": False}
 
 runpod.serverless.start({"handler": handler})
